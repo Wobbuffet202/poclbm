@@ -31,7 +31,7 @@ USER_AGENT = 'poclbm/' + VERSION
 
 TIME_FORMAT = '%d/%m/%Y %H:%M:%S'
 
-TIMEOUT = 5
+TIMEOUT = 15
 
 LONG_POLL_TIMEOUT = 3600
 
@@ -119,11 +119,13 @@ class BitcoinMiner():
 		self.sayLine('%s, %s', (hash, if_else(accepted, 'accepted', 'invalid or stale')))
 
 	def mine(self):
-		self.stop = False
-		longPollThread = Thread(target=self.longPollThread)
-		longPollThread.daemon = True
-		longPollThread.start()
-		Thread(target=self.miningThread).start()
+		if self.stop == True:
+			self.stop = False
+		else:
+			longPollThread = Thread(target=self.longPollThread)
+			longPollThread.daemon = True
+			longPollThread.start()
+			Thread(target=self.miningThread).start()
 
 		while True:
 			if self.stop: return
@@ -140,6 +142,8 @@ class BitcoinMiner():
 					if not self.resultQueue.empty():
 						self.sendResult(self.resultQueue.get(False))					
 				sleep(1)
+			except KeyboardInterrupt:
+				self.exit()
 			except Exception:
 				self.sayLine("Unexpected error:")
 				traceback.print_exc()
@@ -201,7 +205,7 @@ class BitcoinMiner():
 			self.longPollURL = response.getheader('X-Long-Polling', '')
 			self.updateTime = response.getheader('X-Roll-NTime', '')
 			result = loads(response.read())
-			if result['error']:	raise RPCError(result['error']['message'])
+			if result['error']:  raise RPCError(result['error']['message'])
 			return (connection, result)
 		finally:
 			if not result or not response or response.getheader('connection', '') != 'keep-alive':
@@ -239,6 +243,7 @@ class BitcoinMiner():
 	def miningThread(self):
 		self.loadKernel()
 		frame = 1.0 / self.frames
+		fr = self.frames
 		unit = self.worksize * 256
 		globalThreads = unit * 10
 		
@@ -286,9 +291,11 @@ class BitcoinMiner():
 				rate = (threadsRunPace / t) / self.rateDivisor
 				lastRatedPace = now; threadsRunPace = 0
 				r = lastHashRate / rate
-				if r < 0.9 or r > 1.1:
+				if r < 0.9 or r > 1.1 or fr != self.frames:
+					frame = 1.0 / self.frames
 					globalThreads = max(unit * int((rate * frame * self.rateDivisor) / unit), unit)
 					lastHashRate = rate
+					fr = self.frames
 			t = now - lastRated
 			if (t > self.rate):
 				self.hashrate(int((threadsRun / t) / self.rateDivisor))
