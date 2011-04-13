@@ -1,0 +1,18 @@
+Custom Miner for XKCD Bitcoin Pool
+
+Example Usage:
+
+python poclbm.py --user=<username> --pass=<password> --host=67.188.199.192 --port=8332 -d0 -f3 -l100 -r0.5
+	
+	-d<Device ID>  : Device
+		Usually 0 (unless you want to mine your CPU and GPU)
+		
+	-f<Frame Rate> : Primary Framerate (works on GPU only)
+		Set lower for more mining performance, or higher for less display lag. Minimum setting is 3.
+		
+	-l<Frame Rate> : Secondary Framerate (works on GPU only) ***DON'T SET BELOW 3!***
+		Press Ctrl+C to switch between primary (-f) and seconday (-l). No minimum setting.
+		
+	-r<Seconds>    : Hashrate Update Interval
+		1 is the default (meaning it updates every second). 
+		0.5 (twice every second) is what I use, but it's up to preference.
