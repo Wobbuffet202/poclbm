@@ -1,0 +1,5 @@
+# Ignore Python Bytecode
+*.pyc
+
+# Ignore ELF (Executable and Linkable Format) Files
+*.elf

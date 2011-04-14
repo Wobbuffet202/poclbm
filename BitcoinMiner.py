@@ -1,4 +1,5 @@
 import sys
+import signal
 import socket
 import httplib
 import traceback
@@ -22,26 +23,26 @@ def socketwrap(family=socket.AF_INET, type=socket.SOCK_STREAM, proto=0):
 	sockobj = realsocket(family, type, proto)
 	sockobj.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 	return sockobj
+
 socket.socket = socketwrap
 
+VERSION       = '201103.beta3'
+USER_AGENT    = 'poclbm/' + VERSION
+TIME_FORMAT   = '%d/%m/%Y %H:%M:%S'
+TIMEOUT       = 15
+MAX_REDIRECTS = 3
+OUTPUT_SIZE   = 0x100
 
-VERSION = '201103.beta3'
+MIN_USERFPS = 3 # To keep the computer usable
 
-USER_AGENT = 'poclbm/' + VERSION
+MIN_ASKRATE = 1
+MAX_ASKRATE = 10
 
-TIME_FORMAT = '%d/%m/%Y %H:%M:%S'
-
-TIMEOUT = 15
-
-LONG_POLL_TIMEOUT = 3600
-
+# Long Polling
+LONG_POLL_TIMEOUT			= 3600
 LONG_POLL_MAX_ASKRATE = 60 - TIMEOUT
 
-MAX_REDIRECTS = 3
-
-OUTPUT_SIZE = 0x100
-
-
+# Determine if a hash is valid under a target
 def belowOrEquals(hash, target):
 	for i in range(len(hash) - 1, -1, -1):
 		reversed = bytereverse(hash[i])
@@ -51,43 +52,75 @@ def belowOrEquals(hash, target):
 			return False
 	return True
 
+
+# If-Else Shortcut
 def if_else(condition, trueVal, falseVal):
 	if condition:
 		return trueVal
 	else:
 		return falseVal
 
+
+def signal_handler(signal, frame):
+	print '\b\b  \nExiting...'
+	sys.exit(0)
+
+signal.signal(signal.SIGQUIT, signal_handler)
+
 class NotAuthorized(Exception): pass
+
 class RPCError(Exception): pass
 
 class BitcoinMiner():
-	def __init__(self, device, host, user, password, port=8332, frames=30, rate=1, askrate=5, worksize=-1, vectors=False, verbose=False):
+	def __init__(self, device, host, user, password, port=8332, rate=1, askrate=5, worksize=-1, vectors=False, verbose=False):
 		(self.defines, self.rateDivisor, self.hashspace) = if_else(vectors, ('-DVECTORS', 500, 0x7FFFFFFF), ('', 1000, 0xFFFFFFFF))
 		self.defines += (' -DOUTPUT_SIZE=' + str(OUTPUT_SIZE))
 		self.defines += (' -DOUTPUT_MASK=' + str(OUTPUT_SIZE - 1))
-
-		self.device = device
-		self.rate = max(float(rate), 0.1)
-		self.askrate = max(int(askrate), 1)
-		self.askrate = min(self.askrate, 10)
+		
+		# Settings
+		self.device   = device
+		self.rate     = max(float(rate), 0.1)
+		self.askrate  = max(int(askrate), MIN_ASKRATE)
+		self.askrate  = min(self.askrate, MAX_ASKRATE)
 		self.worksize = int(worksize)
-		self.frames = max(int(frames), 3)
-		self.verbose = verbose
-		self.longPollActive = self.stop = False
-		self.update = True
-		self.lock = RLock()
+		self.verbose  = verbose
+		
+		# State
+		self.stop       = False
+		self.update 	  = True
+		self.updateTime = ''
+		self.lastWork   = 0
+		self.lastBlock  = ''
+		
+		# Framerate Switching
+		self.frames = self.fps_fast = self.fps_slow = 30
+		self.updateFrame = False
+		
+		# Long Polling
+		self.longPollURL = ''
+		self.longPollActive = False
+		
+		# Locks
+		self.lock       = RLock()
 		self.outputLock = RLock()
-		self.lastWork = 0
-		self.lastBlock = self.updateTime = self.longPollURL = ''
-
-		self.workQueue = Queue()
+		
+		# Queues
+		self.workQueue   = Queue()
 		self.resultQueue = Queue()
-
+		
+		# Connection
 		self.host = '%s:%s' % (host.replace('http://', ''), port)
 		self.postdata = {"method": 'getwork', 'id': 'json'}
 		self.headers = {"User-Agent": USER_AGENT, "Authorization": 'Basic ' + b64encode('%s:%s' % (user, password))}
 		self.connection = None
-
+	
+	def swapFrame(self):
+		if self.frames == self.fps_fast:
+			self.frames = self.fps_slow
+		else:
+			self.frames = self.fps_fast
+		self.updateFrame = True
+	
 	def say(self, format, args=()):
 		with self.outputLock:
 			if self.verbose:
@@ -95,38 +128,36 @@ class BitcoinMiner():
 			else:
 				sys.stdout.write('\r                                                            \r%s' % (format % args))
 			sys.stdout.flush()
-
+	
 	def sayLine(self, format, args=()):
 		if not self.verbose:
 			format = '%s, %s\n' % (datetime.now().strftime(TIME_FORMAT), format)
 		self.say(format, args)
-
+	
 	def exit(self):
 		self.stop = True
-
+	
 	def hashrate(self, rate):
-		self.say('%s khash/s', rate)
-
+		self.say('%s Mh/s', rate / 1000.0)
+	
 	def failure(self, message):
 		print '\n%s' % message
 		self.exit()
-
+	
 	def diff1Found(self, hash, target):
 		if self.verbose and target < 0xFFFF0000L:
 			self.sayLine('checking %s <= %s', (hash, target))
-
+	
 	def blockFound(self, hash, accepted):
 		self.sayLine('%s, %s', (hash, if_else(accepted, 'accepted', 'invalid or stale')))
-
+	
 	def mine(self):
-		if self.stop == True:
-			self.stop = False
-		else:
-			longPollThread = Thread(target=self.longPollThread)
-			longPollThread.daemon = True
-			longPollThread.start()
-			Thread(target=self.miningThread).start()
-
+		self.stop = False
+		longPollThread = Thread(target=self.longPollThread)
+		longPollThread.daemon = True
+		longPollThread.start()
+		Thread(target=self.miningThread).start()
+		
 		while True:
 			if self.stop: return
 			try:
@@ -137,17 +168,17 @@ class BitcoinMiner():
 					with self.lock:
 						if self.update:
 							self.queueWork(work)
-
 				with self.lock:
 					if not self.resultQueue.empty():
 						self.sendResult(self.resultQueue.get(False))					
 				sleep(1)
 			except KeyboardInterrupt:
-				self.exit()
+				print '\b\b  \nPress Ctrl+\ to Exit'
+				self.swapFrame()
 			except Exception:
 				self.sayLine("Unexpected error:")
 				traceback.print_exc()
-
+	
 	def queueWork(self, work):
 		with self.lock:
 			self.workQueue.put(work)
@@ -157,7 +188,7 @@ class BitcoinMiner():
 					self.lastBlock = work['data'][48:56]
 					while not self.resultQueue.empty():
 						result = self.resultQueue.get(False)
-
+	
 	def sendResult(self, result):
 		for i in xrange(OUTPUT_SIZE):
 			if result['output'][i]:
@@ -172,7 +203,7 @@ class BitcoinMiner():
 						accepted = self.getwork(d)
 						if accepted != None:
 							self.blockFound(pack('I', long(h[6])).encode('hex'), accepted)
-
+	
 	def getwork(self, data=None):
 		try:
 			if not self.connection:
@@ -186,7 +217,7 @@ class BitcoinMiner():
 			self.say('%s', e)
 		except (IOError, httplib.HTTPException, ValueError):
 			self.say('Problems communicating with bitcoin RPC')
-
+	
 	def request(self, connection, url, headers, data=None):
 		result = response = None
 		try:
@@ -211,7 +242,7 @@ class BitcoinMiner():
 			if not result or not response or response.getheader('connection', '') != 'keep-alive':
 				connection.close()
 				connection = None
-
+	
 	def longPollThread(self):
 		connection = None
 		while True:
@@ -239,22 +270,21 @@ class BitcoinMiner():
 					self.sayLine('long poll: %s', e)
 				except (IOError, httplib.HTTPException, ValueError):
 					pass
-
+	
 	def miningThread(self):
 		self.loadKernel()
 		frame = 1.0 / self.frames
-		fr = self.frames
 		unit = self.worksize * 256
 		globalThreads = unit * 10
 		
 		queue = cl.CommandQueue(self.context)
-
+		
 		lastRatedPace = lastRated = lastNTime = time()
 		base = lastHashRate = threadsRunPace = threadsRun = 0
 		f = np.zeros(8, np.uint32)
 		output = np.zeros(OUTPUT_SIZE+1, np.uint32)
 		output_buf = cl.Buffer(self.context, cl.mem_flags.WRITE_ONLY | cl.mem_flags.USE_HOST_PTR, hostbuf=output)
-
+		
 		work = None
 		while True:
 			if self.stop: return
@@ -264,35 +294,36 @@ class BitcoinMiner():
 				except Empty: continue
 				else:
 					if not work: continue
-
 					noncesLeft = self.hashspace
 					data   = np.array(unpack('IIIIIIIIIIIIIIII', work['data'][128:].decode('hex')), dtype=np.uint32)
 					state  = np.array(unpack('IIIIIIII',         work['midstate'].decode('hex')),   dtype=np.uint32)
 					target = np.array(unpack('IIIIIIII',         work['target'].decode('hex')),     dtype=np.uint32)
 					state2 = partial(state, data, f)
-
-			self.miner.search(	queue, (globalThreads, ), (self.worksize, ),
-								state[0], state[1], state[2], state[3], state[4], state[5], state[6], state[7],
-								state2[1], state2[2], state2[3], state2[5], state2[6], state2[7],
-								pack('I', uint32(0xFFFF0000)), pack('I', 0),
-								pack('I', base),
-								f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7],
-								output_buf)
+			
+			self.miner.search(queue, (globalThreads, ), (self.worksize, ),
+				state[0], state[1],  state[2],  state[3],  state[4],  state[5],  state[6],
+				state[7], state2[1], state2[2], state2[3], state2[5], state2[6], state2[7],
+				pack('I', uint32(0xFFFF0000)),
+				pack('I', 0),
+				pack('I', base),
+				f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7],
+				output_buf)
 			cl.enqueue_read_buffer(queue, output_buf, output)
-
+			
 			noncesLeft -= globalThreads
 			threadsRunPace += globalThreads
 			threadsRun += globalThreads
 			base = uint32(base + globalThreads)
-
+			
 			now = time()
 			t = now - lastRatedPace
 			if (t > 1):
 				rate = (threadsRunPace / t) / self.rateDivisor
 				lastRatedPace = now; threadsRunPace = 0
 				r = lastHashRate / rate
-				if r < 0.9 or r > 1.1 or fr != self.frames:
+				if r < 0.9 or r > 1.1 or self.updateFrame:
 					frame = 1.0 / self.frames
+					self.updateFrame = False
 					globalThreads = max(unit * int((rate * frame * self.rateDivisor) / unit), unit)
 					lastHashRate = rate
 					fr = self.frames
@@ -300,7 +331,6 @@ class BitcoinMiner():
 			if (t > self.rate):
 				self.hashrate(int((threadsRun / t) / self.rateDivisor))
 				lastRated = now; threadsRun = 0
-
 			if self.updateTime == '':
 				if noncesLeft < TIMEOUT * globalThreads * self.frames:
 					self.update = True
@@ -308,9 +338,9 @@ class BitcoinMiner():
 				elif 0xFFFFFFFFFFF < noncesLeft < 0xFFFFFFFFFFFF:
 					self.sayLine('warning: job finished, miner is idle')
 					work = None
-
+			
 			queue.finish()
-
+			
 			if output[OUTPUT_SIZE]:
 				result = {}
 				result['work'] = work
@@ -322,12 +352,12 @@ class BitcoinMiner():
 					self.resultQueue.put(result)
 				output.fill(0)
 				cl.enqueue_write_buffer(queue, output_buf, output)
-
+			
 			if self.updateTime != '' and now - lastNTime > 1:
 				data[1] = bytereverse(bytereverse(data[1]) + 1)
 				state2 = partial(state, data, f)
 				lastNTime = now
-
+	
 	def loadKernel(self):
 		self.context = cl.Context([self.device], None, None)
 		if (self.device.extensions.find('cl_amd_media_ops') != -1):
@@ -352,3 +382,4 @@ class BitcoinMiner():
 
 		if (self.worksize == -1):
 			self.worksize = self.miner.search.get_work_group_info(cl.kernel_work_group_info.WORK_GROUP_SIZE, self.device)
+	
